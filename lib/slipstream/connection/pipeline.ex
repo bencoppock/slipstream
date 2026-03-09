@@ -52,7 +52,7 @@ defmodule Slipstream.Connection.Pipeline do
   defp decode_message(
          %{
            raw_message: {:DOWN, ref, :process, _pid, reason},
-           state: %{client_ref: ref}
+           state: %State{client_ref: ref}
          } = p
        ) do
     put_message(p, event(%Events.ParentProcessExited{reason: reason}))
@@ -64,7 +64,7 @@ defmodule Slipstream.Connection.Pipeline do
              {:status, ref, status},
              {:headers, ref, headers} | _maybe_done
            ],
-           state: %{request_ref: ref} = state
+           state: %State{request_ref: ref} = state
          } = p
        ) do
     case Mint.WebSocket.new(state.conn, ref, status, headers) do
@@ -77,7 +77,7 @@ defmodule Slipstream.Connection.Pipeline do
             response_headers: headers
           })
         )
-        |> put_state(%State{p.state | conn: conn, websocket: websocket})
+        |> put_state(%{p.state | conn: conn, websocket: websocket})
 
       {:error, _conn, reason} ->
         failure_info = %{
@@ -140,7 +140,7 @@ defmodule Slipstream.Connection.Pipeline do
     case Mint.WebSocket.stream(p.state.conn, p.raw_message) do
       {:ok, conn, messages} ->
         put_in(p.raw_message, messages)
-        |> put_state(%State{p.state | conn: conn})
+        |> put_state(%{p.state | conn: conn})
         |> decode_message()
 
       {:error, conn, %Mint.TransportError{reason: :closed}, _} ->
@@ -173,11 +173,11 @@ defmodule Slipstream.Connection.Pipeline do
 
   @spec handle_message(t()) :: t()
   defp handle_message(
-         %{message: :connect, state: %{config: config} = state} = p
+         %{message: :connect, state: %State{config: config} = state} = p
        ) do
     with {:ok, conn} <- Impl.http_connect(config),
          {:ok, conn, ref} <- Impl.websocket_upgrade(conn, config) do
-      put_state(p, %State{state | conn: conn, request_ref: ref})
+      put_state(p, %{state | conn: conn, request_ref: ref})
     else
       # coveralls-ignore-start
       {:error, conn, reason} ->
@@ -258,7 +258,8 @@ defmodule Slipstream.Connection.Pipeline do
         topic: cmd.topic,
         event: cmd.event,
         payload: cmd.payload,
-        ref: ref
+        ref: ref,
+        join_ref: state.joins[cmd.topic]
       })
 
     case p do
@@ -270,10 +271,13 @@ defmodule Slipstream.Connection.Pipeline do
   end
 
   defp handle_message(
-         %{message: command(%Commands.JoinTopic{} = cmd), state: state} = p
+         %{
+           message: command(%Commands.JoinTopic{} = cmd),
+           state: %State{} = state
+         } = p
        ) do
     {ref, state} = State.next_ref(state)
-    state = %State{state | joins: Map.put(state.joins, cmd.topic, ref)}
+    state = %{state | joins: Map.put(state.joins, cmd.topic, ref)}
 
     p
     |> put_state(state)
@@ -287,10 +291,13 @@ defmodule Slipstream.Connection.Pipeline do
   end
 
   defp handle_message(
-         %{message: command(%Commands.LeaveTopic{} = cmd), state: state} = p
+         %{
+           message: command(%Commands.LeaveTopic{} = cmd),
+           state: %State{} = state
+         } = p
        ) do
     {ref, state} = State.next_ref(state)
-    state = %State{state | leaves: Map.put(state.leaves, cmd.topic, ref)}
+    state = %{state | leaves: Map.put(state.leaves, cmd.topic, ref)}
 
     p
     |> put_state(state)
@@ -304,7 +311,10 @@ defmodule Slipstream.Connection.Pipeline do
   end
 
   defp handle_message(
-         %{message: command(%Commands.CloseConnection{}), state: state} = p
+         %{
+           message: command(%Commands.CloseConnection{}),
+           state: %State{} = state
+         } = p
        ) do
     Mint.HTTP.close(state.conn)
 
@@ -322,7 +332,7 @@ defmodule Slipstream.Connection.Pipeline do
   defp handle_message(
          %{
            message: event(%Events.ParentProcessExited{reason: reason}),
-           state: state
+           state: %State{} = state
          } = p
        ) do
     Mint.HTTP.close(state.conn)
@@ -333,7 +343,7 @@ defmodule Slipstream.Connection.Pipeline do
   defp handle_message(
          %{
            message: event(%Events.ChannelConnectFailed{} = event),
-           state: state
+           state: %State{} = state
          } = p
        ) do
     Mint.HTTP.close(state.conn)
@@ -351,9 +361,11 @@ defmodule Slipstream.Connection.Pipeline do
   defp handle_message(%{message: event(%Events.PongReceived{})} = p), do: p
   # coveralls-ignore-stop
 
-  defp handle_message(%{message: event(%type{} = event), state: state} = p)
+  defp handle_message(
+         %{message: event(%type{} = event), state: %State{} = state} = p
+       )
        when type in [Events.TopicJoinFailed, Events.TopicJoinClosed] do
-    state = %State{state | joins: Map.delete(state.joins, event.topic)}
+    state = %{state | joins: Map.delete(state.joins, event.topic)}
 
     route_event state, event
 
@@ -361,16 +373,22 @@ defmodule Slipstream.Connection.Pipeline do
   end
 
   defp handle_message(
-         %{message: event(%Events.TopicLeaveAccepted{} = event), state: state} =
+         %{
+           message: event(%Events.TopicLeaveAccepted{} = event),
+           state: %State{} = state
+         } =
            p
        ) do
-    state = %State{state | leaves: Map.delete(state.leaves, event.topic)}
+    state = %{state | leaves: Map.delete(state.leaves, event.topic)}
 
     put_state(p, state)
   end
 
   defp handle_message(
-         %{message: event(%Events.HeartbeatAcknowledged{}), state: state} = p
+         %{
+           message: event(%Events.HeartbeatAcknowledged{}),
+           state: %State{} = state
+         } = p
        ) do
     # coveralls-ignore-start
     put_state(p, State.reset_heartbeat(state))
@@ -378,7 +396,10 @@ defmodule Slipstream.Connection.Pipeline do
   end
 
   defp handle_message(
-         %{message: event(%Events.ChannelConnected{} = event), state: state} = p
+         %{
+           message: event(%Events.ChannelConnected{} = event),
+           state: %State{} = state
+         } = p
        ) do
     timer =
       if state.config.heartbeat_interval_msec != 0 do
@@ -392,7 +413,7 @@ defmodule Slipstream.Connection.Pipeline do
       end
 
     state =
-      %State{state | status: :connected, heartbeat_timer: timer}
+      %{state | status: :connected, heartbeat_timer: timer}
       |> State.reset_heartbeat()
 
     route_event state, event
@@ -402,7 +423,10 @@ defmodule Slipstream.Connection.Pipeline do
 
   # coveralls-ignore-start
   defp handle_message(
-         %{message: event(%Events.ChannelClosed{} = event), state: state} = p
+         %{
+           message: event(%Events.ChannelClosed{} = event),
+           state: %State{} = state
+         } = p
        ) do
     Mint.HTTP.close(state.conn)
 
@@ -410,7 +434,7 @@ defmodule Slipstream.Connection.Pipeline do
       :timer.cancel(state.heartbeat_timer)
     end
 
-    state = %State{state | status: :terminating}
+    state = %{state | status: :terminating}
 
     route_event state, event
 
@@ -450,15 +474,15 @@ defmodule Slipstream.Connection.Pipeline do
   defp default_return(p), do: p
 
   @spec build_events(t()) :: t()
-  defp build_events(%{events: []} = p), do: p
+  defp build_events(%__MODULE__{events: []} = p), do: p
 
-  defp build_events(%{events: events} = p) do
+  defp build_events(%__MODULE__{events: events} = p) do
     built_events =
       Enum.map(events, fn %{type: type, attrs: attrs} ->
         build_event(type, attrs)
       end)
 
-    %__MODULE__{p | built_events: built_events}
+    %{p | built_events: built_events}
   end
 
   defp emit_events(%{built_events: []} = p), do: p
@@ -482,13 +506,13 @@ defmodule Slipstream.Connection.Pipeline do
   # --- token API
 
   @spec put_state(t(), State.t()) :: t()
-  def put_state(p, state) do
-    %__MODULE__{p | state: state}
+  def put_state(%__MODULE__{} = p, %State{} = state) do
+    %{p | state: state}
   end
 
   @spec put_message(t(), term()) :: t()
-  def put_message(p, message) do
-    %__MODULE__{p | message: message}
+  def put_message(%__MODULE__{} = p, message) do
+    %{p | message: message}
   end
 
   @doc """
@@ -498,8 +522,8 @@ defmodule Slipstream.Connection.Pipeline do
   build the event in the `build_events/1` phase of the pipeline
   """
   @spec put_event(t(), atom(), Keyword.t() | map()) :: t()
-  def put_event(p, event, attrs \\ %{}) do
-    %__MODULE__{
+  def put_event(%__MODULE__{} = p, event, attrs \\ %{}) do
+    %{
       p
       | events: p.events ++ [%{type: event, attrs: Enum.into(attrs, %{})}]
     }
@@ -511,8 +535,8 @@ defmodule Slipstream.Connection.Pipeline do
   This value will be given to the GenServer callback that invoked
   """
   @spec put_return(t(), term()) :: t()
-  def put_return(p, return) do
-    %__MODULE__{p | return: return}
+  def put_return(%__MODULE__{} = p, return) do
+    %{p | return: return}
   end
 
   def push_message(p, message) do
